@@ -76,9 +76,27 @@ class SimpleZeroLossPeakModel(AbstractZeroLossPeakModel):
         right = min(yss.shape[-1], z + 3)
         result = numpy.zeros(yss.shape)
         result[..., left:right] = yss[..., left:right]
-        # print(f"{z=} {left=} {right=}")
         return result
+
+
+class OneTenthZeroLossPeakModel(AbstractZeroLossPeakModel):
+
+    def __init__(self, zero_loss_peak_model: str, title: str = None):
+        super().__init__(zero_loss_peak_model, title)
+
+    def _perform_fits(self, yss: numpy.ndarray, z: int) -> numpy.ndarray:
+        result = numpy.zeros(yss.shape)
+        for index, ys in enumerate(yss):
+            mx_pos = numpy.argmax(ys)
+            mx = ys[mx_pos]
+            mx_fraction = mx / 10
+            left = max(0, mx_pos - sum(ys[:mx_pos + 1] > mx_fraction))
+            right = min(yss.shape[-1], mx_pos + (mx_pos - left) + 1)
+            result[index, left:right] = ys[left:right]
+        return result
+
 
 
 # register models with the registry.
 Registry.register_component(SimpleZeroLossPeakModel("simple_peak_model", title=_("Simple")), {"zlp-model"})
+Registry.register_component(OneTenthZeroLossPeakModel("one_tenth_peak_model", title=_("OneTenth")), {"zlp-model"})
