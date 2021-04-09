@@ -14,6 +14,8 @@ from nion.swift.model import Schema
 from nion.swift import Facade
 from nion.utils import Registry
 
+from nion.eels_analysis import ZLP_Analysis
+
 
 _ = gettext.gettext
 
@@ -23,18 +25,22 @@ class FitZeroLossPeak:
     inputs = {
         "eels_spectrum_data_item": {"label": _("EELS Spectrum")},
         "zlp_model": {"label": _("Zero Loss Peak Model"), "entity_id": "zlp_model"},
+        "show_zlp_stats": {"label": _("Show ZLP stats")}
         }
     outputs = {
         "zero_loss_peak": {"label": _("Background")},
         "subtracted": {"label": _("Subtracted")},
+        "zlp_interval": {"label": _("ZLP Interval")}
     }
 
     def __init__(self, computation, **kwargs):
         self.computation = computation
         self.__model_xdata = None
         self.__subtracted_xdata = None
+        self.__zlp_interval_bounds = None
+        self.__eels_spectrum_data_item = None
 
-    def execute(self, eels_spectrum_data_item, zlp_model, **kwargs) -> None:
+    def execute(self, eels_spectrum_data_item, zlp_model, show_zlp_stats, **kwargs) -> None:
         try:
             spectrum_xdata = eels_spectrum_data_item.xdata
             assert spectrum_xdata.is_datum_1d
@@ -42,6 +48,8 @@ class FitZeroLossPeak:
             eels_spectrum_xdata = spectrum_xdata
             model_xdata = None
             subtracted_xdata = None
+            zlp_position = None
+            zlp_fwhm = None
             if zlp_model._data_structure.entity:
                 entity_id = zlp_model._data_structure.entity.entity_type.entity_id
                 for component in Registry.get_components_by_type("zlp-model"):
@@ -51,12 +59,26 @@ class FitZeroLossPeak:
                         model_xdata = fit_result["zero_loss_peak_model"]
                         # use 'or' to avoid doing subtraction if subtracted_spectrum already present
                         subtracted_xdata = fit_result.get("subtracted_spectrum", None) or Core.calibrated_subtract_spectrum(spectrum_xdata, model_xdata)
+                        zlp_stats = fit_result.get("zlp_stats", dict())
+                        zlp_position = zlp_stats.get("position")
+                        zlp_fwhm = zlp_stats.get("fwhm")
             if model_xdata is None:
                 model_xdata = DataAndMetadata.new_data_and_metadata(numpy.zeros_like(eels_spectrum_xdata.data), intensity_calibration=eels_spectrum_xdata.intensity_calibration, dimensional_calibrations=eels_spectrum_xdata.dimensional_calibrations)
             if subtracted_xdata is None:
                 subtracted_xdata = DataAndMetadata.new_data_and_metadata(eels_spectrum_xdata.data, intensity_calibration=eels_spectrum_xdata.intensity_calibration, dimensional_calibrations=eels_spectrum_xdata.dimensional_calibrations)
+
+            if show_zlp_stats:
+                if zlp_position is None or zlp_fwhm is None:
+                    _, _, left, right = ZLP_Analysis.estimate_zlp_amplitude_position_width_com(model_xdata.data)
+                else:
+                    left, right = (zlp_position - 0.5 * zlp_fwhm, zlp_position + 0.5 * zlp_fwhm)
+                self.__zlp_interval_bounds = (left, right)
+            else:
+                self.__zlp_interval_bounds = None
+
             self.__model_xdata = model_xdata
             self.__subtracted_xdata = subtracted_xdata
+            self.__eels_spectrum_data_item = eels_spectrum_data_item
         except Exception as e:
             import traceback
             print(traceback.format_exc())
@@ -66,6 +88,24 @@ class FitZeroLossPeak:
     def commit(self):
         self.computation.set_referenced_xdata("zero_loss_peak", self.__model_xdata)
         self.computation.set_referenced_xdata("subtracted", self.__subtracted_xdata)
+        if self.__zlp_interval_bounds is not None:
+            start, end = self.__zlp_interval_bounds
+            data_length = self.__eels_spectrum_data_item.data.shape[-1]
+            zlp_interval = self.computation.get_result("zlp_interval", None)
+            if not zlp_interval:
+                zlp_interval = self.__eels_spectrum_data_item.add_interval_region(start / data_length, end / data_length)
+                self.computation.set_result("zlp_interval", zlp_interval)
+            zlp_interval.interval = start / data_length, end / data_length
+            zlp_interval.graphic_id = "zlp_interval"
+            zlp_interval._graphic.color = "#0F0"
+            cal = self.__eels_spectrum_data_item.xdata.dimensional_calibrations[-1]
+            zlp_interval.label = (f"Position: {cal.convert_to_calibrated_value_str(start + 0.5 * (end - start))}, \n"
+                                  f"FWHM: {cal.convert_to_calibrated_size_str(end - start)}")
+        else:
+            zlp_interval = self.computation.get_result("zlp_interval", None)
+            if zlp_interval:
+                self.__eels_spectrum_data_item.remove_region(zlp_interval)
+                self.computation.set_result("zlp_interval", None)
 
 
 def add_peak_fitting_computation(api: Facade.API_1, library: Facade.Library, display_item: Facade.Display, data_item: Facade.DataItem) -> None:
@@ -80,19 +120,24 @@ def add_peak_fitting_computation(api: Facade.API_1, library: Facade.Library, dis
                                    inputs={
                                        "eels_spectrum_data_item": data_item,
                                        "zlp_model": api._new_api_object(zlp_model),
+                                       "show_zlp_stats": True,
                                    },
                                    outputs={
                                        "zero_loss_peak": zero_loss_peak,
-                                       "subtracted": signal}
+                                       "subtracted": signal,
+                                       "zlp_interval": None}
                                    )
     display_item._display_item.append_display_data_channel_for_data_item(zero_loss_peak._data_item)
     display_item._display_item.append_display_data_channel_for_data_item(signal._data_item)
     display_item._display_item.move_display_layer_at_index_backward(0)
     display_item._display_item.move_display_layer_at_index_backward(1)
     display_item._display_item._set_display_layer_properties(0, label=_("Zero Loss Peak"),
-                                                             fill_color="rgba(255, 0, 0, 0.3)")
-    display_item._display_item._set_display_layer_properties(1, label=_("Signal"), fill_color="#0F0")
-    display_item._display_item._set_display_layer_properties(2, label=_("Data"), fill_color="#1E90FF")
+                                                             fill_color="rgba(255, 0, 0, 0.2)",
+                                                             stroke_color="rgba(255, 0, 0, 1.0)")
+    display_item._display_item._set_display_layer_properties(1, label=_("Subtracted"),
+                                                             fill_color="rgba(0, 255, 0, 0.2)",
+                                                             stroke_color="rgba(0, 255, 0, 1.0)")
+    display_item._display_item._set_display_layer_properties(2, label=_("Raw Data"), fill_color="#1E90FF")
     display_item._display_item.set_display_property("legend_position", "top-right")
 
 
